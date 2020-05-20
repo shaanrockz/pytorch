@@ -340,6 +340,15 @@ def expand(g, self, size, implicit):
     size = sym_help._maybe_get_const(size, 'is')
     if not sym_help._is_value(size):
         size = g.op("Constant", value_t=torch.LongTensor(size))
+    elif sym_help._is_packed_list(size):
+        # Expand with -1 dim value means dim is unchanged.
+        # Since onnx::expand supports two-way broadcasting,
+        # -1 dim value can be exported to onnx as 1
+        size = view(g, stack(g, size, 0), [-1])
+    dtype = 4  # dim type is int64
+    ones = ones_like(g, size, dtype)
+    neg_ones = mul(g, ones, g.op("Constant", value_t=torch.tensor(-1)))
+    size = where(g, g.op("Equal", size, neg_ones), ones, size)
     return g.op("Expand", self, size)
 
 
@@ -377,7 +386,9 @@ def embedding_bag(g,
                 include_last_offset_i=include_last_offset)
 
 
-def size(g, self, dim):
+def size(g, self, dim=None):
+    if dim is None:
+        return g.op("Shape", self)
     if sym_help._maybe_get_const(dim, 'i') < 0:
         rank = self.type().dim()
         if rank:
@@ -573,19 +584,35 @@ def softmax(g, input, dim, dtype=None):
     #           [0.167, 0.167, 0.167]]
     # So only when dim and axis both equal to ndim - 1 (the last dimension),
     # their semantics are equivalent.
-    # So use softmax when dim and axis both equal to ndim - 1
-    # otherwise compute softmax using a subgraph with other operators
+    # So use softmax when dim and axis both equal to ndim - 1,
+    # otherwise transpose the input to put the vectors to be normalized to the last dimension.
+    # When input rank is not known at export time we compute softmax using a subgraph
+    # with other operators
     input_dim = input.type().dim()
-    if input_dim:
+    if input_dim is not None:
         # TODO: remove this as onnx opset 11 spec allows negative axes
         if dim < 0:
             dim = input_dim + dim
-        if input_dim == dim + 1:
-            softmax = g.op('Softmax', input, axis_i=dim)
-            if dtype and dtype.node().kind() != 'prim::Constant':
-                parsed_dtype = sym_help._get_const(dtype, 'i', 'dtype')
-                softmax = g.op("Cast", softmax, to_i=sym_help.scalar_type_to_onnx[parsed_dtype])
-            return softmax
+
+        is_transpose_required = (input_dim != dim + 1)
+
+        if is_transpose_required:
+            axes = list(range(input_dim))
+            axes[dim], axes[-1] = axes[-1], axes[dim]
+            input = g.op("Transpose", input, perm_i=axes)
+            dim = input_dim - 1
+
+        softmax = g.op('Softmax', input, axis_i=dim)
+        if dtype and dtype.node().kind() != 'prim::Constant':
+            parsed_dtype = sym_help._get_const(dtype, 'i', 'dtype')
+            softmax = g.op("Cast", softmax, to_i=sym_help.scalar_type_to_onnx[parsed_dtype])
+
+        if is_transpose_required:
+            softmax = g.op("Transpose", softmax, perm_i=axes)
+        return softmax
+
+    # Apply max normalization.
+    input = g.op('Sub', input, g.op('ReduceMax', input, axes_i=[dim], keepdims_i=1))
 
     exp = g.op('Exp', input)
     sum = g.op('ReduceSum', exp, axes_i=[dim])
@@ -1038,6 +1065,7 @@ def conv_transpose3d(g, input, weight, bias, stride, padding, output_padding, gr
 
 @parse_args('v', 'v', 'v', 'v', 'v', 'i', 'f', 'f', 'i')
 def batch_norm(g, input, weight, bias, running_mean, running_var, training, momentum, eps, cudnn_enabled):
+    sym_help.assert_training_mode(training, "dropout")
     input_sizes = input.type().sizes()
 
     if weight is None or sym_help._is_none(weight):
@@ -1054,8 +1082,8 @@ def batch_norm(g, input, weight, bias, running_mean, running_var, training, mome
     out = g.op("BatchNormalization", input, weight, bias, running_mean, running_var,
                epsilon_f=eps,
                momentum_f=1 - momentum,
-               outputs=1 if not training else 5)
-    if not training:
+               outputs=1 if not sym_help._training_mode else 5)
+    if not sym_help._training_mode:
         return out
     else:
         res, new_running_mean, new_running_var, saved_mean, saved_var = out
@@ -1212,6 +1240,10 @@ def abs(g, self):
     return g.op("Abs", self)
 
 
+def absolute(g, self):
+    return g.op("Abs", self)
+
+
 def log(g, self):
     return g.op("Log", self)
 
@@ -1221,7 +1253,16 @@ def log1p(g, self):
 
 
 def pow(g, self, exponent):
-    return g.op("Pow", self, exponent)
+    f_dtype = self_dtype = self.type().scalarType()
+    if not sym_help._is_fp(self):
+        f_dtype = 'Float'
+        self = g.op("Cast", self, to_i=sym_help.cast_pytorch_to_onnx[f_dtype])
+    if not sym_help._is_fp(exponent):
+        exponent = g.op("Cast", exponent, to_i=sym_help.cast_pytorch_to_onnx[f_dtype])
+    pow = g.op("Pow", self, exponent)
+    if self_dtype and self_dtype != f_dtype:
+        pow = g.op("Cast", pow, to_i=sym_help.cast_pytorch_to_onnx[self_dtype])
+    return pow
 
 
 def clamp(g, self, min, max):
@@ -1287,7 +1328,9 @@ def exp(g, self):
 
 @parse_args('v', 'f', 'i')
 def dropout(g, input, p, train):
-    if not train:  # in eval mode, dropout is non-op
+    sym_help.assert_training_mode(train, "dropout")
+    # in eval mode, dropout is non-op - if the node's train param is set to False, dropout is non-op
+    if not sym_help._training_mode:
         return input
     warnings.warn("Dropout is a training op and should not be exported in inference mode. "
                   "Make sure to call eval() on the model, and to export it with param training=False.")
@@ -1412,14 +1455,14 @@ def ones_like(g, input, dtype=None, layout=None, device=None, pin_memory=False, 
 
 
 def full(g, sizes, value, dtype, layout, device, pin_memory=False):
-    if dtype is None:
-        dtype = 6  # float
     const_value = sym_help._maybe_get_const(value, 't')
     if sym_help._is_value(const_value):
+        dtype = 6 if dtype is None else dtype
         tmp = zeros(g, sizes, dtype, layout, device)
         return add(g, tmp, value, g.op("Constant", value_t=torch.tensor(1)))
     else:
         dtype = sym_help._get_const(dtype, 'i', 'dtype')
+        dtype = 6 if dtype is None else dtype
         return g.op("ConstantOfShape", sizes,
                     value_t=torch.tensor([const_value], dtype=sym_help.scalar_type_to_pytorch_type[dtype]))
 
@@ -1491,6 +1534,12 @@ def sort(g, self, dim, decending, out=None):
 
     return g.op("TopK", self, k_i=self.type().sizes()[dim], axis_i=dim, outputs=2)
 
+
+def numel(g, self):
+    shape = g.op("Shape", self)
+    return g.op("ReduceProd", shape, keepdims_i=0)
+
+
 @parse_args('v', 'i', 'i', 'i', 'i', 'none')
 def topk(g, self, k, dim, largest, sorted, out=None):
     if out is not None:
@@ -1508,10 +1557,16 @@ def to(g, self, *args):
             # aten::to(Tensor, Device, bool, bool, memory_format)
             return self
         else:
-            # aten::to(Tensor, ScalarType, bool, bool, memory_format)
-            dtype = sym_help._get_const(args[0], 'i', 'dtype')
-            # memory_format is ignored
-            return g.op("Cast", self, to_i=sym_help.scalar_type_to_onnx[dtype])
+            dtype = sym_help._maybe_get_const(args[0], 'i')
+            if sym_help._is_value(dtype):
+                # aten::to(Tensor, Tensor, bool, bool, memory_format)
+                other = args[0]
+                dtype = other.type().scalarType()
+                return g.op("Cast", self, to_i=sym_help.cast_pytorch_to_onnx[dtype])
+            else:
+                # aten::to(Tensor, ScalarType, bool, bool, memory_format)
+                # memory_format is ignored
+                return g.op("Cast", self, to_i=sym_help.scalar_type_to_onnx[dtype])
     elif len(args) == 5:
         # aten::to(Tensor, Device, ScalarType, bool, bool, memory_format)
         dtype = sym_help._get_const(args[1], 'i', 'dtype')

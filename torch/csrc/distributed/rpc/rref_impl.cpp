@@ -70,7 +70,9 @@ UserRRef::UserRRef(
     const RRefId& rrefId,
     const ForkId& forkId,
     TypePtr type)
-    : RRef(ownerId, rrefId, std::move(type)), forkId_(forkId) {
+    : RRef(ownerId, rrefId, std::move(type)),
+      forkId_(forkId),
+      confirmedByOwner_(false) {
   // Do nothing,
   // (1) If this UserRRef is a fork of an existing RRef, RRefContext will send
   //     a RREF_FORK_REQUEST message to the owner.
@@ -104,7 +106,7 @@ const ForkId& UserRRef::forkId() const {
   return forkId_;
 }
 
-IValue UserRRef::toHere() {
+IValue UserRRef::toHere() const {
   // see Note [Best-Effort Check on Deleted UserRRefs]
   TORCH_CHECK(
       !deletedOnOwner_,
@@ -113,6 +115,19 @@ IValue UserRRef::toHere() {
       " and ForkId=",
       forkId(),
       " has been deleted. Cannot call to_here() on it after deletion.");
+  TORCH_CHECK(
+      !type_->is_module(),
+      "User RRef with RRefId=",
+      rrefId(),
+      " and ForkId=",
+      forkId(),
+      " is an RRef to a ScriptModule. "
+      "It can't be sent through RPC "
+      "from owner, ",
+      ownerName(),
+      ", to user, ",
+      RpcAgent::getCurrentRpcAgent()->getWorkerInfo().name_,
+      ".");
 
   auto agent = RpcAgent::getCurrentRpcAgent();
 
@@ -187,40 +202,27 @@ RRefForkData UserRRef::fork() const {
 //////////////////////////  OwnerRRef  /////////////////////////////////////
 
 const IValue& OwnerRRef::getValue() const {
-  std::unique_lock<std::mutex> lock(mutex_);
-  valueCV_.wait(lock, [this] { return value_.has_value(); });
-  return value_.value();
+  future_->wait();
+  if (future_->hasError()) {
+    (void)future_->value(); // Throws the error.
+  }
+  return future_->constValue();
 }
 
 bool OwnerRRef::hasValue() const {
-  std::lock_guard<std::mutex> lock(mutex_);
-  return value_.has_value();
+  return future_->completed();
 }
 
-std::shared_ptr<FutureMessage> OwnerRRef::getFuture() {
-  std::unique_lock<std::mutex> lock(mutex_);
-  if (future_.get()) {
-    return future_;
-  }
-  future_ = std::make_shared<FutureMessage>();
-  std::shared_ptr<FutureMessage> ret = future_;
-  if (value_.has_value()) {
-    lock.unlock();
-    ret->markCompleted(Message());
-  }
-  return ret;
+std::shared_ptr<JitFuture> OwnerRRef::getFuture() {
+  return future_;
 }
 
 void OwnerRRef::setValue(IValue&& value) {
-  std::unique_lock<std::mutex> lock(mutex_);
-  value_ = std::move(value);
-  std::shared_ptr<FutureMessage> future;
-  future.swap(future_);
-  lock.unlock();
-  valueCV_.notify_all();
-  if (future.get() && !future->completed()) {
-    future->markCompleted(Message());
-  }
+  future_->markCompleted(value);
+}
+
+void OwnerRRef::setError(const std::string& error) {
+  future_->setErrorIfNeeded(error);
 }
 
 } // namespace rpc
