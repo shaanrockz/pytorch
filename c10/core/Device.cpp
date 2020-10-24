@@ -30,7 +30,7 @@
 namespace c10 {
 namespace {
 DeviceType parse_type(const std::string& device_string) {
-  static const std::array<std::pair<std::string, DeviceType>, 9> types = {{
+  static const std::array<std::pair<std::string, DeviceType>, 11> types = {{
       {"cpu", DeviceType::CPU},
       {"cuda", DeviceType::CUDA},
       {"mkldnn", DeviceType::MKLDNN},
@@ -38,8 +38,10 @@ DeviceType parse_type(const std::string& device_string) {
       {"opencl", DeviceType::OPENCL},
       {"ideep", DeviceType::IDEEP},
       {"hip", DeviceType::HIP},
+      {"fpga", DeviceType::FPGA},
       {"msnpu", DeviceType::MSNPU},
       {"xla", DeviceType::XLA},
+      {"vulkan", DeviceType::Vulkan},
   }};
   auto device = std::find_if(
       types.begin(),
@@ -51,7 +53,7 @@ DeviceType parse_type(const std::string& device_string) {
     return device->second;
   }
   AT_ERROR(
-      "Expected one of cpu, cuda, mkldnn, opengl, opencl, ideep, hip, msnpu, xla device type at start of device string: ", device_string);
+      "Expected one of cpu, cuda, mkldnn, opengl, opencl, ideep, hip, msnpu, xla, vulkan device type at start of device string: ", device_string);
 }
 } // namespace
 

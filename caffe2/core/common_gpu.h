@@ -132,6 +132,8 @@ CAFFE2_CUDA_API int GetGPUIDForPointer(const void* ptr);
 
 /**
  * Gets the device property for the given device. This function is thread safe.
+ * The initial run on this function is ~1ms/device; however, the results are
+ * cached so subsequent runs should be much faster.
  */
 CAFFE2_CUDA_API const cudaDeviceProp& GetDeviceProperty(const int device);
 
@@ -254,15 +256,6 @@ CAFFE2_CUDA_API const char* curandGetErrorString(curandStatus_t error);
        i += blockDim.x * gridDim.x)                                 \
     for (size_t j = blockIdx.y * blockDim.y + threadIdx.y; j < (m); \
          j += blockDim.y * gridDim.y)
-
-// CUDA_KERNEL_ASSERT is a macro that wraps an assert() call inside cuda
-// kernels. This is not supported by Apple platforms so we special case it.
-// See http://docs.nvidia.com/cuda/cuda-c-programming-guide/#assertion
-#if defined(__APPLE__) || defined(__HIP_PLATFORM_HCC__)
-#define CUDA_KERNEL_ASSERT(...)
-#else // __APPLE__
-#define CUDA_KERNEL_ASSERT(...) assert(__VA_ARGS__)
-#endif // __APPLE__
 
 // The following helper functions are here so that you can write a kernel call
 // when you are not particularly interested in maxing out the kernels'

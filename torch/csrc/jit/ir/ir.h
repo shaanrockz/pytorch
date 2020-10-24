@@ -332,6 +332,16 @@ struct TORCH_API Node {
     }
     return scope_->namesFromRoot();
   }
+
+  Node* copyMetadata(Node* from) {
+    this->setSourceRange(from->sourceRange());
+    this->setScope(from->scope());
+    if (auto cs = from->callstack()) {
+      this->setCallStack(*cs);
+    }
+    return this;
+  }
+
   c10::optional<InlinedCallStackPtr> callstack() const {
     return callstack_;
   }
@@ -404,6 +414,8 @@ struct TORCH_API Node {
     return inputs_.at(i);
   }
 
+  bool hasNamedInput(const std::string& unqualName) const;
+  Value* namedInput(const std::string& unqualName) const;
   Value* namedInput(Symbol name) const;
 
   c10::optional<IValue> get(Symbol name) const;
@@ -424,6 +436,12 @@ struct TORCH_API Node {
 
   bool isNondeterministic() const;
   bool hasSideEffects() const;
+
+  // instructions lowered by the interpreter and not run in the optimized graph
+  bool notExecutedOp() const {
+    return kind_ == prim::Constant || kind_ == prim::profile ||
+        kind_ == prim::profile_optional;
+  }
 
   // Graphs
 
@@ -792,7 +810,7 @@ struct TORCH_API Node {
     auto it = findAttr(name, true);
     auto* child = dynamic_cast<T*>(it->get());
     if (child == nullptr) {
-      throw AttributeError(name, true);
+      throw IRAttributeError(name, true);
     }
     return child->value();
   }
@@ -807,7 +825,7 @@ struct TORCH_API Node {
       return v->name == name;
     });
     if (required && it == values_.end()) {
-      throw AttributeError(name, false);
+      throw IRAttributeError(name, false);
     }
     AT_ASSERT(!required || it != values_.end());
     return it;
@@ -819,7 +837,7 @@ struct TORCH_API Node {
       return v->name == name;
     });
     if (required && it == values_.end()) {
-      throw AttributeError(name, false);
+      throw IRAttributeError(name, false);
     }
     AT_ASSERT(!required || it != values_.end());
     return it;
@@ -1105,6 +1123,8 @@ struct Graph {
       Value* idx,
       const TypePtr& output_type);
   TORCH_API Node* createTupleSlice(Value* tup, int64_t beg, int64_t end);
+  TORCH_API Node* createEnumName(Value* e);
+  TORCH_API Node* createEnumValue(Value* e);
   TORCH_API Node* createList(
       const TypePtr& elem_type,
       at::ArrayRef<Value*> values);
@@ -1309,6 +1329,28 @@ struct ProfileOp : public Node {
   static constexpr Symbol Kind = ::c10::prim::profile;
   ProfileOp(Graph* graph, std::function<void(std::vector<IValue>&)> callback)
       : Node(graph, ::c10::prim::profile), callback_(callback) {}
+
+  void cloneFrom(Node* other_) override;
+  Node* allocNewInstance(Graph* g) override;
+
+  const std::function<void(std::vector<IValue>&)>& getCallback() const {
+    return callback_;
+  }
+
+  void setCallback(std::function<void(std::vector<IValue>&)> callback) {
+    callback_ = callback;
+  }
+
+ private:
+  std::function<void(std::vector<IValue>&)> callback_;
+};
+
+struct TORCH_API ProfileOptionalOp : public Node {
+  static constexpr Symbol Kind = ::c10::prim::profile_optional;
+  ProfileOptionalOp(
+      Graph* graph,
+      std::function<void(std::vector<IValue>&)> callback)
+      : Node(graph, ::c10::prim::profile_optional), callback_(callback) {}
 
   void cloneFrom(Node* other_) override;
   Node* allocNewInstance(Graph* g) override;

@@ -1,12 +1,11 @@
 #pragma once
 
 #include <c10/util/ArrayRef.h>
-#include <c10/util/complex_type.h>
+#include <c10/util/complex.h>
 #include <c10/util/Half.h>
 #include <c10/util/BFloat16.h>
 #include <c10/util/Optional.h>
 #include <c10/util/typeid.h>
-#include <c10/util/complex_type.h>
 
 #include <complex>
 #include <cstdint>
@@ -39,7 +38,8 @@ namespace c10 {
   _(c10::qint8, QInt8) /* 12 */                          \
   _(c10::quint8, QUInt8) /* 13 */                        \
   _(c10::qint32, QInt32) /* 14 */                        \
-  _(at::BFloat16, BFloat16) /* 15 */
+  _(at::BFloat16, BFloat16) /* 15 */                     \
+  _(c10::quint4x2, QUInt4x2) /* 16 */
 
 
 // If you want to support ComplexHalf for real, add ComplexHalf
@@ -94,25 +94,21 @@ AT_FORALL_SCALAR_TYPES_WITH_COMPLEX_AND_QINTS(SPECIALIZE_ScalarTypeToCPPType)
 
 #undef SPECIALIZE_ScalarTypeToCPPType
 
-
-// These are used to map C++ types to ScalarTypes.
-
-template <typename>
-struct CPPTypeToScalarType {
-  constexpr static c10::ScalarType value = c10::ScalarType::Undefined;
-};
-
-#define SPECIALIZE_CPPTypeToScalarType(cpp_type, scalar_type)                  \
-  template <>                                                                  \
-  struct CPPTypeToScalarType<cpp_type> {                                       \
-    constexpr static c10::ScalarType value = c10::ScalarType::scalar_type;     \
-  };
-
-AT_FORALL_SCALAR_TYPES_WITH_COMPLEX_AND_QINTS(SPECIALIZE_CPPTypeToScalarType)
-
-#undef SPECIALIZE_CPPTypeToScalarType
-
 }
+
+template <typename T>
+struct CppTypeToScalarType;
+
+#define SPECIALIZE_CppTypeToScalarType(cpp_type, scalar_type) \
+  template<>                                                  \
+  struct CppTypeToScalarType<cpp_type>:                       \
+    std::integral_constant<c10::ScalarType,                   \
+                           c10::ScalarType::scalar_type>      \
+  {};
+
+AT_FORALL_SCALAR_TYPES_WITH_COMPLEX_AND_QINTS(SPECIALIZE_CppTypeToScalarType)
+
+#undef SPECIALIZE_CppTypeToScalarType
 
 #define AT_FORALL_SCALAR_TYPES(_) \
   _(uint8_t, Byte)                \
@@ -159,7 +155,8 @@ AT_FORALL_SCALAR_TYPES_WITH_COMPLEX_AND_QINTS(SPECIALIZE_CPPTypeToScalarType)
 #define AT_FORALL_QINT_TYPES(_)  \
   _(c10::qint8, QInt8)           \
   _(c10::quint8, QUInt8)         \
-  _(c10::qint32, QInt32)
+  _(c10::qint32, QInt32)         \
+  _(c10::quint4x2, QUInt4x2)
 
 #define AT_FORALL_COMPLEX_TYPES(_)             \
   _(c10::complex<float>, ComplexFloat)         \
@@ -203,6 +200,13 @@ static inline ScalarType typeMetaToScalarType(caffe2::TypeMeta dtype) {
   }
   AT_ERROR(
       "Unsupported TypeMeta in ATen: ", dtype, " (please report this error)");
+}
+
+inline optional<at::ScalarType> optTypeMetaToScalarType(optional<caffe2::TypeMeta> type_meta) {
+  if (!type_meta.has_value()) {
+    return c10::nullopt;
+  }
+  return typeMetaToScalarType(*type_meta);
 }
 
 static inline bool operator==(ScalarType t, caffe2::TypeMeta m) {
@@ -277,7 +281,7 @@ static inline bool isComplexType(ScalarType t) {
 
 static inline bool isQIntType(ScalarType t) {
   // Don't forget to extend this when adding new QInt types
-  return t == ScalarType:: QInt8 || t == ScalarType::QUInt8 || t == ScalarType::QInt32;
+  return t == ScalarType:: QInt8 || t == ScalarType::QUInt8 || t == ScalarType::QInt32 || t == ScalarType::QUInt4x2;
 }
 
 static inline ScalarType toQIntType(ScalarType t) {
@@ -301,6 +305,8 @@ static inline ScalarType toUnderlying(ScalarType t) {
       return ScalarType::Char;
     case ScalarType::QInt32:
       return ScalarType::Int;
+    case ScalarType::QUInt4x2:
+      return ScalarType::Byte;
     default:
       return t;
   }
@@ -313,12 +319,13 @@ static inline bool isSignedType(ScalarType t) {
       return std::numeric_limits<ctype>::is_signed;
 
   switch (t) {
-    case ScalarType::ComplexFloat: \
-    case ScalarType::ComplexDouble: \
-      return true; \
+    case ScalarType::ComplexHalf:
+    case ScalarType::ComplexFloat:
+    case ScalarType::ComplexDouble:
+      return true;
     AT_FORALL_SCALAR_TYPES_AND3(Half, Bool, BFloat16, CASE_SIGNED)
     default:
-      AT_ERROR("Unknown ScalarType");
+      TORCH_CHECK(false, "Unknown ScalarType");
   }
   #undef CASE_SIGNED
 }
@@ -329,12 +336,27 @@ static inline bool isUnderlying(ScalarType type, ScalarType qtype) {
 
 static inline ScalarType toValueType(ScalarType t) {
   switch (t) {
+    case ScalarType::ComplexHalf:
+      return ScalarType::Half;
     case ScalarType::ComplexFloat:
       return ScalarType::Float;
     case ScalarType::ComplexDouble:
       return ScalarType::Double;
     default:
       return t;
+  }
+}
+
+static inline ScalarType toComplexType(ScalarType t) {
+  switch (t) {
+    case ScalarType::Half:
+      return ScalarType::ComplexHalf;
+    case ScalarType::Float:
+      return ScalarType::ComplexFloat;
+    case ScalarType::Double:
+      return ScalarType::ComplexDouble;
+    default:
+      TORCH_CHECK(false, "Unknown Complex ScalarType");
   }
 }
 
@@ -404,22 +426,22 @@ static inline ScalarType promoteTypes(ScalarType a, ScalarType b) {
   static constexpr ScalarType _promoteTypesLookup[static_cast<int>(
       ScalarType::NumOptions)][static_cast<int>(ScalarType::NumOptions)] = {
         /*        u1  i1  i2  i4  i8  f2  f4  f8  c2  c4  c8  b1  q1  q2  q3  bf*/
-        /* u1 */ {u1, i2, i2, i4, i8, f2, f4, f8, ud, c4, c8, u1, ud, ud, ud, ud},
-        /* i1 */ {i2, i1, i2, i4, i8, f2, f4, f8, ud, c4, c8, i1, ud, ud, ud, ud},
-        /* i2 */ {i2, i2, i2, i4, i8, f2, f4, f8, ud, c4, c8, i2, ud, ud, ud, ud},
-        /* i4 */ {i4, i4, i4, i4, i8, f2, f4, f8, ud, c4, c8, i4, ud, ud, ud, ud},
-        /* i8 */ {i8, i8, i8, i8, i8, f2, f4, f8, ud, c4, c8, i8, ud, ud, ud, ud},
-        /* f2 */ {f2, f2, f2, f2, f2, f2, f4, f8, ud, c4, c8, f2, ud, ud, ud, ud},
-        /* f4 */ {f4, f4, f4, f4, f4, f4, f4, f8, ud, c4, c8, f4, ud, ud, ud, ud},
-        /* f8 */ {f8, f8, f8, f8, f8, f8, f8, f8, ud, c8, c8, f8, ud, ud, ud, ud},
+        /* u1 */ {u1, i2, i2, i4, i8, f2, f4, f8, ud, c4, c8, u1, ud, ud, ud, bf},
+        /* i1 */ {i2, i1, i2, i4, i8, f2, f4, f8, ud, c4, c8, i1, ud, ud, ud, bf},
+        /* i2 */ {i2, i2, i2, i4, i8, f2, f4, f8, ud, c4, c8, i2, ud, ud, ud, bf},
+        /* i4 */ {i4, i4, i4, i4, i8, f2, f4, f8, ud, c4, c8, i4, ud, ud, ud, bf},
+        /* i8 */ {i8, i8, i8, i8, i8, f2, f4, f8, ud, c4, c8, i8, ud, ud, ud, bf},
+        /* f2 */ {f2, f2, f2, f2, f2, f2, f4, f8, ud, c4, c8, f2, ud, ud, ud, f4},
+        /* f4 */ {f4, f4, f4, f4, f4, f4, f4, f8, ud, c4, c8, f4, ud, ud, ud, f4},
+        /* f8 */ {f8, f8, f8, f8, f8, f8, f8, f8, ud, c8, c8, f8, ud, ud, ud, f8},
         /* c2 */ {ud, ud, ud, ud, ud, ud, ud, ud, c2, c4, c8, ud, ud, ud, ud, ud},
-        /* c4 */ {c4, c4, c4, c4, c4, c4, c4, c8, c4, c4, c8, c4, ud, ud, ud, ud},
-        /* c8 */ {c8, c8, c8, c8, c8, c8, c8, c8, c8, c8, c8, c8, ud, ud, ud, ud},
-        /* b1 */ {u1, i1, i2, i4, i8, f2, f4, f8, ud, c4, c8, b1, ud, ud, ud, ud},
+        /* c4 */ {c4, c4, c4, c4, c4, c4, c4, c8, c4, c4, c8, c4, ud, ud, ud, c4},
+        /* c8 */ {c8, c8, c8, c8, c8, c8, c8, c8, c8, c8, c8, c8, ud, ud, ud, c8},
+        /* b1 */ {u1, i1, i2, i4, i8, f2, f4, f8, ud, c4, c8, b1, ud, ud, ud, bf},
         /* q1 */ {ud, ud, ud, ud, ud, ud, ud, ud, ud, ud, ud, ud, ud, ud, ud, ud},
         /* q2 */ {ud, ud, ud, ud, ud, ud, ud, ud, ud, ud, ud, ud, ud, ud, ud, ud},
         /* q3 */ {ud, ud, ud, ud, ud, ud, ud, ud, ud, ud, ud, ud, ud, ud, ud, ud},
-        /* bf */ {ud, ud, ud, ud, ud, ud, ud, ud, ud, ud, ud, ud, ud, ud, ud, bf},
+        /* bf */ {bf, bf, bf, bf, bf, f4, f4, f8, ud, c4, c8, bf, ud, ud, ud, bf},
   };
   return _promoteTypesLookup[static_cast<int>(a)][static_cast<int>(b)];
 }
